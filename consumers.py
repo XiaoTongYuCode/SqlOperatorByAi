@@ -57,7 +57,7 @@ class SQLChatConsumer(AsyncWebsocketConsumer):
         
     def _execute_sql_sync(self, sql: str) -> Dict[str, Any]:
         """
-        同步执行SQL语句的辅助方法
+        同步执行SQL语句的辅助方法，使用字段备注替换字段名
         
         Args:
             sql: 要执行的SQL语句
@@ -74,24 +74,36 @@ class SQLChatConsumer(AsyncWebsocketConsumer):
                     # 尝试获取结果
                     rows = cursor.fetchall()
                     # 获取列名
-                    columns = [col[0] for col in cursor.description]
+                    original_columns = [col[0] for col in cursor.description]
+                    
+                    # 获取字段备注信息
+                    column_comments = self._get_column_comments(sql)
+                    
+                    # 创建一个新的列名列表，根据字段备注替换原始字段名
+                    display_columns = []
+                    for col in original_columns:
+                        # 如果有备注，使用备注作为显示名，否则使用原始字段名
+                        display_columns.append(column_comments.get(col, col))
                     
                     # 构建结果
                     results = []
                     for row in rows:
                         result_dict = {}
                         for i, value in enumerate(row):
+                            # 使用备注或原始名作为键
+                            key = display_columns[i]
+                            
                             # 处理datetime和date类型，转换为字符串
                             if hasattr(value, 'isoformat'):  # 检查是否为datetime或date类型
-                                result_dict[columns[i]] = value.isoformat()
+                                result_dict[key] = value.isoformat()
                             # 处理其他不可JSON序列化的类型
                             elif isinstance(value, (set, frozenset)):
-                                result_dict[columns[i]] = list(value)
+                                result_dict[key] = list(value)
                             elif value is None or isinstance(value, (str, int, float, bool, list, dict)):
-                                result_dict[columns[i]] = value
+                                result_dict[key] = value
                             else:
                                 # 其他类型转换为字符串
-                                result_dict[columns[i]] = str(value)
+                                result_dict[key] = str(value)
                         results.append(result_dict)
                     
                     return {
@@ -112,6 +124,79 @@ class SQLChatConsumer(AsyncWebsocketConsumer):
                 'status': 'error',
                 'error': str(e)
             }
+            
+    def _get_column_comments(self, sql: str) -> Dict[str, str]:
+        """
+        获取SQL查询涉及的字段备注
+        
+        Args:
+            sql: SQL查询语句
+            
+        Returns:
+            Dict[str, str]: 字段名到字段备注的映射
+        """
+        column_comments = {}
+        
+        try:
+            # 尝试识别查询涉及的表名
+            table_pattern = r'\bFROM\s+`?(\w+)`?'
+            table_match = re.search(table_pattern, sql, re.IGNORECASE)
+            
+            # 查找JOIN语句中的表
+            join_pattern = r'\bJOIN\s+`?(\w+)`?'
+            join_matches = re.findall(join_pattern, sql, re.IGNORECASE)
+            
+            # 收集所有涉及的表
+            tables = []
+            if table_match:
+                tables.append(table_match.group(1))
+            tables.extend(join_matches)
+            
+            # 获取所有相关表的字段注释
+            if connection.vendor == 'mysql' and tables:
+                with connection.cursor() as comment_cursor:
+                    for table_name in tables:
+                        comment_cursor.execute(f"""
+                            SELECT COLUMN_NAME, COLUMN_COMMENT
+                            FROM INFORMATION_SCHEMA.COLUMNS
+                            WHERE TABLE_SCHEMA = DATABASE() 
+                            AND TABLE_NAME = '{table_name}'
+                            AND COLUMN_COMMENT != ''
+                        """)
+                        for col_name, comment in comment_cursor.fetchall():
+                            if comment.strip():  # 只保存有实际内容的注释
+                                # 对于多表查询中的同名字段，使用"表名.字段名"作为键
+                                if col_name in column_comments:
+                                    # 处理字段名冲突的情况
+                                    full_col_name = f"{table_name}.{col_name}"
+                                    column_comments[full_col_name] = comment
+                                else:
+                                    column_comments[col_name] = comment
+            
+            # 处理列别名
+            alias_pattern = r'(\w+)\.(\w+)(?:\s+AS\s+|\s+)(\w+)'
+            alias_matches = re.findall(alias_pattern, sql, re.IGNORECASE)
+            
+            for table, col, alias in alias_matches:
+                # 检查原始列是否有注释
+                orig_col = f"{table}.{col}"
+                if orig_col in column_comments:
+                    column_comments[alias] = column_comments[orig_col]
+                elif col in column_comments:
+                    column_comments[alias] = column_comments[col]
+                    
+            # 处理简单列别名
+            simple_alias_pattern = r'`?(\w+)`?\s+(?:AS\s+)?`?(\w+)`?'
+            simple_alias_matches = re.findall(simple_alias_pattern, sql, re.IGNORECASE)
+            
+            for col, alias in simple_alias_matches:
+                if col != alias and col in column_comments:
+                    column_comments[alias] = column_comments[col]
+                        
+        except Exception as e:
+            logger.warning(f"获取字段注释时出错: {str(e)}")
+            
+        return column_comments
 
     def _get_database_structure_sync(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -323,8 +408,9 @@ class SQLChatConsumer(AsyncWebsocketConsumer):
         system_prompt = f"""
         你是一个SQL生成助手。根据用户的描述，生成对应的SQL语句。
 
-        以下是数据库结构概览：
+        <数据库结构概览>
         {formatted_db_structure}
+        </数据库结构概览>
 
         请按以下要求生成SQL:
         1. 只输出SQL语句，不要有任何解释
@@ -386,15 +472,6 @@ class SQLChatConsumer(AsyncWebsocketConsumer):
             # 如果检测到SQL操作意图
             if operation_info["operation_type"]:
                 logger.info(f"检测到操作类型: {operation_info['operation_type']}")
-                
-                # 获取并发送数据库结构概览
-                db_structure = await self.get_database_structure()
-                db_structure_text = await self.format_db_structure_for_ai(db_structure)
-                
-                await self.send(text_data=json.dumps({
-                    'content': f"\n\n### 数据库结构概览\n{db_structure_text}",
-                    'is_last_message': False
-                }))
                 
                 await self.send(text_data=json.dumps({
                     'content': '',
